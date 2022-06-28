@@ -1,0 +1,331 @@
+//=====================================================================================================================
+//                                        NASA - University of Maryland (ESSIC)
+// Remote Sensing of Land Cover and Ecosystems: Country-level Ecosystem Extent and Change Mapping in Sub-Saharan Africa
+//                                                  
+// Project: Nypa Palm Mapping in the Niger Delta 
+// Code: Nypa Palm Class Likelihood Classification
+// Written by: Abigail Barenblitt, NASA Goddard and University of Maryland  
+// Co-authors: Nathan Thomas, NASA Goddard
+// Objective: This code identifies the class likelihood of Nypa Palm, Mangroves, and Water
+// on a per pixel level in the Niger Delta in 2020
+
+// THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+// INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,FITNESS FOR A PARTICULAR 
+// PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+// FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+// ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+//=====================================================================================================================
+
+
+//=======================================================================================
+//STEP 1: Set Up Map
+//=======================================================================================
+//*************************************************************
+//1a. Set Up Map
+//*************************************************************
+
+Map.setCenter(8.0884, 4.7068, 9);   
+ 
+//*************************************************************
+//1b. Map Mangrove extent in 2019
+//*************************************************************
+
+Map.addLayer(ext2019, {palette:['395CF8'], min:1, max:1}, 'Celio Extent 2019', false)
+
+//=======================================================================================
+//STEP 2: Set up Sentinel Data
+//=======================================================================================
+//*************************************************************
+//2a. Pulling in Sentinel Data
+//*************************************************************
+
+// Establish start and end dates. These will be used in all following iterations of the model with all sensors
+//------------------------------------------------------------------------------------------------------------
+var startDate = '2020-01-01'
+var endDate = '2020-12-31'
+
+// Load the Sentinel-1 ImageCollection.
+//-------------------------------------
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD_FLOAT').filterDate(startDate, endDate)
+.filterBounds(studyArea);
+
+// Filter by metadata properties.
+//-------------------------------
+var vh = sentinel1
+  // Filter to get images with VV and VH dual polarization.
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  // Filter to get images collected in interferometric wide swath mode.
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filterMetadata('resolution_meters', 'equals' , 10);
+
+//*************************************************************
+//2b. Create Composite
+//*************************************************************
+// Create a composite from means at different polarizations
+//---------------------------------------------------------------------------
+var compositeOG = ee.Image.cat([
+  vh.select('VH').mean(),
+  vh.select('VV').mean()
+])
+
+
+//Convert Composite to DB and Add RVI and SR indices
+//---------------------------------------------------
+var compositeLog = compositeOG.log10().multiply(10)
+
+var RVI = compositeLog.expression('(4*VH)/(VV+VH)',{
+          'VH':compositeLog.select('VH'),
+          'VV':compositeLog.select('VV')
+            }).rename('RVI');
+            
+var SR = compositeLog.select('VV').divide(compositeLog.select('VH')).rename('SR');
+
+var composite = compositeLog.addBands(RVI).addBands(SR)
+
+
+//Clip Composite to Mangrove Areas
+//--------------------------------
+var compositeMask = composite.clip(ext2019)
+
+// Display as a composite of polarization and backscattering characteristics.
+//----------------------------------------------------------------------------
+Map.addLayer(composite, {min: [-15,-8,-0.3], max: [-10,-5,0.3], bands: ['VH', 'VV','SR']}, 'Sentinel2020', false);
+        
+
+
+//=======================================================================================
+//STEP 3: Class Likelihood Model
+//=======================================================================================               
+//*************************************************************
+//3a. Assemble Training Data
+//*************************************************************
+
+//Assemble Training Classes
+//---------------------------
+var classes = NypaPalm
+              .merge(Water)
+              .merge(Mangrove)
+              
+//*************************************************************
+//3b. Assemble Random Forest Classification
+//*************************************************************
+
+//Define bands to use as predictors
+//---------------------------------
+var bands = ['VV','VH','SR','RVI']//Red Edge Bands
+
+//Assemble Random Forest Samples
+var samples = compositeMask.select(bands).sampleRegions({
+collection: classes, // Set of geometries selected in 4.1
+properties: ['landcover'], // Label from each geometry
+scale: 10 // Make each sample the same size as Landsat pixel
+}).randomColumn('random'); // creates a column with random numbers
+
+
+//Begin MULTIPROBABILITY Random Forest Classification
+//----------------------------------------------------
+var classifier = ee.Classifier.smileRandomForest(500)
+    .setOutputMode('MULTIPROBABILITY')
+    .train({
+      features: samples.select(['VV','VH','SR','RVI', 'landcover']),
+      classProperty: 'landcover',
+      inputProperties: bands
+    });
+
+// Apply the classifier the whole image in AOI
+//----------------------------------------------
+var classifiedrf = compositeMask.classify(classifier).multiply(100).int();
+
+// Clean data from small disturbances or anomolies
+//-------------------------------------------------------------
+var cleanRF = classifiedrf.reduceNeighborhood({ //run classification through a neighborhood filter
+                reducer: ee.Reducer.mode(), //choose most common value in neighborhood
+                kernel: ee.Kernel.square(2,'pixels') //define neighborhood
+      });
+
+var pixelcount = cleanRF.connectedPixelCount(100, false); //Create an image that shows the number of pixels each pixel is connected to
+var countmask = pixelcount.select(0).gt(25); //filter out all pixels connected to 4 or less 
+var final_RF = cleanRF.updateMask(countmask); //mask classfication image to exclude small patches
+
+
+//*************************************************************
+//3c. Vizualize Results
+//*************************************************************
+
+var paletteMAP = [
+'#440154FF', // Purple, Nypa Palm(Class value 1)
+'#39568CFF', // Dark Blue, Water (Class value 3) 
+'#29AF7FFF',//Light Green, Mangrove (Class value 5)
+
+];
+
+//Reduce region of results to Study Area East of Port Harcourt
+//-------------------------------------------------------------
+var east = final_RF.clip(studyArea)
+
+Map.addLayer (classifiedrf.clip(studyArea), {min: 50, max: 100}, 'Classification Sentinel SAR East 2020 PROB');
+
+
+//=======================================================================================
+//STEP 4: Mapping Confidence
+//======================================================================================= 
+//*************************************************
+//4a. Get array of probability values
+//************************************************
+
+
+//Convert array to multiBand
+//--------------------------
+var c = [];                 // make an empty array to hold year band names
+for (var i = 1; i <= 3; ++i) c.push('class'+i.toString()); // fill the array with years from the startYear to the endYear and convert them to string
+
+classifiedrf = classifiedrf.arrayFlatten([c]); 
+
+print (classifiedrf)
+
+//*************************************************
+//4b. Pull out probability values for visualization
+//************************************************
+//Function to get probabilities
+//------------------------------
+var votes_1_2 = function(image){
+  
+  //Function to normalize probabilities. it could be needed for future improvements
+  //var sum = image.reduce('sum')
+ // var normalized = image.divide(sum).multiply(100).toShort()
+  
+  var nipa = image.select('class1');
+  var water = image.select('class2');
+  var mangroves = image.select('class3');
+
+  //1. Maximum probability 
+  // Each band has a value between 1 - 3 in order to identify the class name
+  var max1 = nipa.gt(water).and(nipa.gt(mangroves)).multiply(1);
+  var max2 = water.gt(nipa).and(water.gt(mangroves)).multiply(2);
+  var max3 = mangroves.gt(nipa).and(mangroves.gt(water)).multiply(3);
+ 
+  //2. Second maximum probability.
+  //Eliminate the maximum probability class first. 
+  var del_1 = max1.remap([1,0],[0,1]).multiply(nipa);
+  var del_2 = max2.remap([2,0],[0,1]).multiply(water);
+  var del_3 = max3.remap([3,0],[0,1]).multiply(mangroves);
+ 
+  //3. Same as point 1. But for getting second maximum probability class.
+  var max2_1 = del_1.gt(del_2).and(del_1.gt(del_3)).multiply(1);
+  var max2_2 = del_2.gt(del_1).and(del_2.gt(del_3)).multiply(2);
+  var max2_3 = del_3.gt(del_1).and(del_3.gt(del_2)).multiply(3);
+
+  //4. Probability Value: Where they are the maximum for (FIRST) point 1.
+  var pos1 = nipa.gt(water).and(nipa.gt(mangroves)).multiply(nipa);
+  var pos2 = water.gt(nipa).and(water.gt(mangroves)).multiply(water);//.where(1,2);
+  var pos3 = mangroves.gt(nipa).and(mangroves.gt(water)).multiply(mangroves)//.where(1,3);
+ 
+  //5. Probability Value: Where they are the maximum for (SECOND) point 3. 
+  var pos2_1 = del_1.gt(del_2).and(del_1.gt(del_3)).multiply(nipa);
+  var pos2_2 = del_2.gt(del_1).and(del_2.gt(del_3)).multiply(water);
+  var pos2_3 = del_3.gt(del_1).and(del_3.gt(del_2)).multiply(mangroves);
+ 
+  //Adding 1 and 2th for classes [0-1-2]
+  var p1 = max1.add(max2).add(max3);
+  var p2 = max2_1.add(max2_2).add(max2_3);
+  
+  //adding 1 and 2th in probability values [0-100]
+  var pro1= pos1.add(pos2).add(pos3);
+  var pro2= pos2_1.add(pos2_2).add(pos2_3);
+  
+  var confidence = ee.Image(1).subtract(pro2.divide(pro1));  // [1 - d2/d1] Paper
+  
+  
+  return (p1).addBands(p2).addBands(pro1).addBands(pro2).addBands(confidence)
+          .rename('max_class1','max_class2', 'max_prob1', 'max_prob2', 'confidence');
+};
+
+
+
+//*************************************************
+//4c. Get confidence
+//************************************************
+var confidence = votes_1_2(classifiedrf)
+
+
+//=======================================================================================
+//STEP 5: Visualize Results
+//======================================================================================= 
+
+//*************************************************
+//5a. Pull pre-made palette
+//************************************************
+var palettes = require('users/gena/packages:palettes');
+var palette = palettes.colorbrewer.YlOrRd[9]
+var yodVizParms = {
+  min: 0,
+  max: 1,
+  palette: palette
+};
+
+//**********************************************************
+//5b. Create masks for each class and get class confidence
+//**********************************************************
+var nypaMask = sarOut.eq(1)
+var watMask = sarOut.eq(4)
+var mangMask = sarOut.eq(5)
+
+var nypaConf = confidence.select("confidence")
+                .updateMask(nypaMask).clip(studyArea)
+                
+var watConf = confidence.select("confidence")
+                .updateMask(watMask).clip(studyArea)
+                
+var mangConf = confidence.select("confidence")
+                .updateMask(mangMask).clip(studyArea)
+                
+                
+                
+
+//*************************************************
+//5c. Visualize Results
+//************************************************
+Map.addLayer(confidence.clip(studyArea), {}, "all_data")
+Map.addLayer(confidence.select("confidence").clip(studyArea), yodVizParms, "Confidence") //near zero is bc two probabilties are very similar, 
+Map.addLayer(nypaConf, yodVizParms, "Confidence in Nypa Areas") //near zero is bc two probabilties are very similar, 
+
+//=======================================================================================
+//STEP 5: Export Results
+//======================================================================================= 
+
+Export.image.toDrive({
+    image: confidence.clip(studyArea).toDouble(),
+    description: 'Classified_S1SAR_2020_Confidence_Feb2022',
+    region: studyArea,
+    scale: 10,
+    maxPixels: 1e13 
+  });
+  
+  Export.image.toDrive({
+    image: nypaConf.clip(studyArea),
+    description: 'Classified_S1SAR_2020_Confidence_Feb2022_NYPA',
+    region: studyArea,
+    scale: 10,
+    maxPixels: 1e13 
+  });
+  
+  Export.image.toDrive({
+    image: watConf.clip(studyArea),
+    description: 'Classified_S1SAR_2020_Confidence_Feb2022_WATER',
+    region: studyArea,
+    scale: 10,
+    maxPixels: 1e13 
+  });
+  
+  Export.image.toDrive({
+    image: mangConf.clip(studyArea),
+    description: 'Classified_S1SAR_2020_Confidence_Feb2022_MANG',
+    region: studyArea,
+    scale: 10,
+    maxPixels: 1e13 
+  });
+//*****************************************************************************
+//                      End Code
+//*****************************************************************************
