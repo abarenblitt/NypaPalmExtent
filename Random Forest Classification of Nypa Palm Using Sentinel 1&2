@@ -1,0 +1,636 @@
+//=====================================================================================================================
+//                                        NASA - University of Maryland (ESSIC)
+// Remote Sensing of Land Cover and Ecosystems: Country-level Ecosystem Extent and Change Mapping in Sub-Saharan Africa
+//                                                  
+// Project: Nypa Palm Mapping in the Niger Delta 
+// Code: Nypa Palm Random Forest Classification
+// Written by: Abigail Barenblitt, NASA Goddard and University of Maryland  
+// Co-authors: Nathan Thomas, NASA Goddard
+// Objective: This code distinguishes areas of Nypa Palm from Mangroves and Water in the Niger Delta in 2020
+
+//=====================================================================================================================
+
+
+
+//=======================================================================================
+//STEP 1: Set Up Map
+//=======================================================================================
+//*************************************************************
+//Set Up Map
+//*************************************************************
+Map.setCenter(8.0884, 4.7068, 9);   
+
+//*************************************************************
+//Map Mangrove extent in 2019
+//*************************************************************
+
+Map.addLayer(ext2019, {palette:['395CF8'], min:1, max:1}, 'Mangrove and Associated Systems Extent 2019', false)
+
+
+//=======================================================================================
+//STEP 2: Sentinel 1 SAR Mapping
+//=======================================================================================
+
+//*************************************************************
+//2a. Pulling in Sentinel Data
+//*************************************************************
+
+// Establish start and end dates. These will be used in all following iterations of the model with all sensors
+//------------------------------------------------------------------------------------------------------------
+var startDate = '2020-01-01'
+var endDate = '2020-12-31'
+
+// Load the Sentinel-1 ImageCollection.
+//-------------------------------------
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD_FLOAT').filterDate(startDate, endDate)
+.filterBounds(studyArea);
+
+// Filter by metadata properties.
+//-------------------------------
+var vh = sentinel1
+  // Filter to get images with VV and VH dual polarization.
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  // Filter to get images collected in interferometric wide swath mode.
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filterMetadata('resolution_meters', 'equals' , 10);
+  
+// Create a composite from means at different polarizations
+//---------------------------------------------------------------------------
+var compositeOG = ee.Image.cat([
+  vh.select('VH').mean(),
+  vh.select('VV').mean()
+])
+
+
+//Convert Composite to DB and Add RVI and SR indices
+//---------------------------------------------------
+var compositeLog = compositeOG.log10().multiply(10)
+
+var RVI = compositeLog.expression('(4*VH)/(VV+VH)',{
+          'VH':compositeLog.select('VH'),
+          'VV':compositeLog.select('VV')
+            }).rename('RVI');
+            
+var SR = compositeLog.select('VV').divide(compositeLog.select('VH')).rename('SR');
+
+var composite = compositeLog.addBands(RVI).addBands(SR)
+
+
+//Clip Composite to Mangrove Areas
+//--------------------------------
+var compositeMask = composite.clip(ext2019)
+
+// Display as a composite of polarization and backscattering characteristics.
+//----------------------------------------------------------------------------
+Map.addLayer(composite, {min: [-15,-8,-0.3], max: [-10,-5,0.3], bands: ['VH', 'VV','SR']}, 'Sentinel2020', false);
+
+
+               
+//*************************************************************
+//2b. Assemble Training Data
+//*************************************************************
+
+//Assemble Training Classes
+//-------------------------
+
+var classes = NypaPalm
+              .merge(Water)
+              .merge(Mangrove)
+
+//Examine histogram of TanDEM-X values over Nypa training data to ensure values make sense (<15m)
+//----------------------------------------------------------------------------------------------
+var histogram = ui.Chart.image.histogram(tdxNigeria, NypaPalm, 12);
+print(histogram)
+
+
+//*************************************************************
+//2c. Assemble Random Forest Classification
+//*************************************************************
+
+//Define bands to use as predictors
+//----------------------------------
+var bands = ['VV','VH','SR','RVI']//Red Edge Bands
+
+//Assemble Random Forest Samples
+//-------------------------------
+var samples = compositeMask.select(bands).sampleRegions({
+collection: classes, // Set of geometries selected in 4.1
+properties: ['landcover'], // Label from each geometry
+scale: 10 // Make each sample the same size as Landsat pixel
+}).randomColumn('random'); // creates a column with random numbers
+
+
+
+//Print n training data pixels for each class
+//-------------------------------------------
+print('Valid n =', samples.aggregate_count('.all'));
+print('Valid n Nypa =', samples.filterMetadata('landcover', 'equals', 1).aggregate_count('.all'));
+print('Valid n Water=', samples.filterMetadata('landcover', 'equals', 4).aggregate_count('.all'));
+print('Valid n Mangrove=', samples.filterMetadata('landcover', 'equals', 5).aggregate_count('.all'));
+
+
+//*************************************************************
+//2d. Run Model and take Mode of 1000 runs
+//*************************************************************
+
+//Set up sequence for 1000 runs of the model
+//------------------------------------------
+var runs = ee.List.sequence(1,1000,1)
+
+//Create Random Forest Classification Function
+//-------------------------------------------
+var RF = function(i){
+  var num = ee.Number(i)
+  var classifier = ee.Classifier.smileRandomForest(500,4).train({
+  features: samples.select(['VV','VH','RVI','SR', 'landcover']),
+  classProperty: 'landcover',
+  inputProperties: bands})
+
+  var classified = compositeMask.select(bands).classify(classifier).select('classification').rename('Class')
+  
+  return classified
+}
+
+
+
+//Run RFC Model 1,000 times
+//-------------------------------------------
+var modelRun = runs.map(RF)
+
+//Take mode of the 1,000 runs
+//-------------------------------------------
+var classifiedrf = ee.ImageCollection(modelRun).mode()
+
+
+
+//*************************************************************
+// 2e. Clean Results
+//*************************************************************
+//-------------------------------------------------------------
+var cleanRF = classifiedrf.reduceNeighborhood({ //run classification through a neighborhood filter
+                reducer: ee.Reducer.mode(), //choose most common value in neighborhood
+                kernel: ee.Kernel.square(2,'pixels') //define neighborhood
+      });
+
+var pixelcount = cleanRF.connectedPixelCount(100, false); //Create an image that shows the number of pixels each pixel is connected to
+var countmask = pixelcount.select(0).gt(25); //filter out all pixels connected to 4 or less 
+var final_RF = cleanRF.updateMask(countmask); //mask classfication image to exclude small patches
+
+
+//*************************************************************
+//2f.  Vizualize Results
+//*************************************************************
+
+var paletteMAP = [
+'#440154FF', // Purple, Nypa Palm(Class value 1)
+'#39568CFF', // Dark Blue, Water (Class value 3) 
+'#29AF7FFF',//Light Green, Mangrove (Class value 5)
+
+];
+
+//Reduce region of results to Study Area East of Port Harcourt
+//------------------------------------------------------------
+var clean = final_RF.selfMask().clip(studyArea)//.clip(region)
+
+//Display Results
+//---------------
+Map.addLayer (sarOut, {min: 1, max: 5, palette:paletteMAP}, 'Classification Sentinel SAR East 2020',false);
+
+
+// //*************************************************************
+// // 2g. Create Stratified Random Points for Testing
+// //*************************************************************
+
+// // //Creating Stratified Random Samples
+////-------------------------------------------
+// // var stratSamples = east.stratifiedSample({
+// //                       numPoints:200,
+// //                       classBand: 'classification_mode',
+// //                       region:studyArea,
+// //                       scale: 10,
+// //                       geometries:true
+// //         });
+
+
+// // //Add a 15m Radius buffer around each point
+////------------------------------------------------
+
+// // //Map over our sample Collection to add columns
+////-------------------------------------------------
+// // var stratCoord = stratSamples.map(function(f) {
+// //   //We need to convert the feature to a geometry to get coordinates
+// //   var id = f.id()
+// //   var coord = f.geometry().coordinates() 
+// //   //Set new columns with values for each feature
+// //   var setCoord = f.set('LON',coord.get(0)).set('LAT',coord.get(1)).set('PLOTID',id)
+// //   return setCoord
+// // });
+
+// // var stratBuff = function(feature) {
+// //         var num = feature.get('b1');
+            
+// //         return feature.buffer(15).set('b1', num);
+// //         };
+
+
+// //Map the buffer across all points (see export code below)
+////----------------------------------------------------------
+// var stratPoints = stratCoord.map(stratBuff)
+
+
+//*************************************************************
+//2h. Calculate Accuracy 
+//*************************************************************
+
+//Assemble Testing Data using validated random points
+//----------------------------------------------------
+var testing2 = sarOut.sampleRegions({
+                  collection: valid, 
+                  properties:['UserClass'],
+                  scale:10,
+          });
+
+// Classify the validation data
+//------------------------------
+var testAccuracy = testing2.errorMatrix('Class_mode','UserClass',[1,4,5]);
+
+print('Validation error matrix: ', testAccuracy); //Generates the error matrix to demonstrate accuracy by landcover class type
+print('Validation overall accuracy: ', testAccuracy.accuracy());
+
+
+
+
+//*************************************************************
+//2i. Calculate Landcover 
+//*************************************************************
+
+var final_Nypa = sarOut.select(0).eq(1).selfMask(); 
+var final_Water = sarOut.select(0).eq(4).selfMask();
+var final_Mangrove = sarOut.select(0).eq(5).selfMask();
+
+
+var total = ee.Number(sarOut.gt(0).selfMask().multiply(ee.Image.pixelArea()).reduceRegion({
+                  geometry: studyArea,
+                  reducer: ee.Reducer.sum(),
+                  scale:10, 
+                  maxPixels: 1e16,
+                  crs:'EPSG:4326',
+                  }).get('Class_mode')).divide(10000)
+  
+print(total, 'Total StudyArea in Hectares')
+
+var nypaTotal = ee.Number(final_Nypa.gt(0).selfMask().multiply(ee.Image.pixelArea()).reduceRegion({
+                  geometry: studyArea,
+                  reducer: ee.Reducer.sum(),
+                  scale:10, 
+                  maxPixels: 1e16,
+                  crs:'EPSG:4326',
+                  }).get('Class_mode')).divide(10000)
+  
+print(nypaTotal, 'Total Nypa in Hectares')
+
+
+var waterTotal = ee.Number(final_Water.gt(0).selfMask().multiply(ee.Image.pixelArea()).reduceRegion({
+                  geometry: studyArea,
+                  reducer: ee.Reducer.sum(),
+                  scale:10, 
+                  maxPixels: 1e16,
+                  crs:'EPSG:4326',
+                  }).get('Class_mode')).divide(10000)
+  
+print(waterTotal, 'Total Water in Hectares')
+
+var mangroveTotal = ee.Number(final_Mangrove.gt(0).selfMask().multiply(ee.Image.pixelArea()).reduceRegion({
+                  geometry: studyArea,
+                  reducer: ee.Reducer.sum(),
+                  scale:10, 
+                  maxPixels: 1e16,
+                  crs:'EPSG:4326',
+                  }).get('Class_mode')).divide(10000)
+  
+print(mangroveTotal, 'Total Mangrove in Hectares')
+
+//=======================================================================================
+//STEP 3: Sentinel 2 MSI Mapping
+//=======================================================================================
+
+
+//*************************************************************
+//3a. Pulling in Sentinel Data
+//*************************************************************
+
+/**
+* Function to mask clouds using the Sentinel-2 QA band
+* @param {ee.Image} image Sentinel-2 image
+* @return {ee.Image} cloud masked Sentinel-2 image
+*/
+//---------------------------------------------------
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+}
+
+var dataset = ee.ImageCollection('COPERNICUS/S2_SR')
+                  .filterDate(startDate,endDate)
+                  // Pre-filter to get less cloudy granules.
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',20)
+                  )
+                  .map(maskS2clouds);
+
+
+//*************************************************************
+//3b. Calculate and add NDVI and EVI 
+//*************************************************************
+
+// Function to calculate and add an NDVI band
+//---------------------------------------------
+var addBands = function(image) {
+var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+var evi = image.expression(
+      '2.5 * ((NIR-RED) / (NIR + 6 * RED -7.5 * BLUE))', {
+      'NIR':image.select('B8'),
+      'RED':image.select('B4'),
+      'BLUE':image.select('B2')}).rename('EVI')
+return image.addBands(ndvi).addBands(evi);
+};
+
+// Add NDVI band to image collection
+//------------------------------------
+var S2 = dataset.map(addBands).filterBounds(studyArea);
+
+//Create and clip composite
+//-----------------------------
+var compositeS2 = S2.median().clip(ext2019);
+
+
+var rgbVis = {
+  min: 0.0,
+  max: 0.2,
+  bands: ['B4', 'B3', 'B2'],
+};
+
+//Visualize Composite
+//---------------------
+Map.addLayer(S2.median(),rgbVis,'Sent2',false)
+
+
+//*************************************************************
+//3c. Assemble Random Forest Classification
+//*************************************************************
+
+//Define the Sentinel bands to train your data
+//--------------------------------------------
+var bandsS2 = [ 'B2','B3', 'B4','B5','B6','B7','B8','B8A', 'NDVI'];
+var trainingS2 = compositeS2.select(bandsS2).sampleRegions({
+  collection: classes,
+  properties: ['landcover'],
+  scale: 10
+});
+
+
+//Begin Random Forest Classification
+//-----------------------------------
+var RF2S2 = function(i){
+  var classifierS2 = ee.Classifier.smileRandomForest(500,4).train({
+  features: trainingS2,
+  classProperty: 'landcover',
+  inputProperties: bandsS2
+});
+  var classified = compositeS2.select(bandsS2).classify(classifierS2).select('classification').rename('Class')
+  return classified
+}
+
+
+//Run RFC Model 1,000 times
+//-------------------------------------------
+var modelRun2S2 = runs.map(RF2S2)
+
+//Take mode of the 1,000 runs
+//-------------------------------------------
+var classifiedS2 = ee.ImageCollection(modelRun2S2).mode()
+
+//Subset results to Study Area
+//------------------------------
+var classS2 = classifiedS2.clip(ext2019)
+
+
+//*************************************************************
+//3d. Clean Results
+//*************************************************************
+
+
+//Clean up classification to eliminate small clusters of pixels
+// This reduces noise in the results to display areas that are likely mines rather 
+// than small disturbances or anomolies
+//-------------------------------------------------------------
+var cleanRFS2 = classS2.reduceNeighborhood({ //run classification through a neighborhood filter
+                reducer: ee.Reducer.mode(), //choose most common value in neighborhood
+                kernel: ee.Kernel.square(2,'pixels') //define neighborhood
+      });
+
+var pixelcountS2 = cleanRFS2.connectedPixelCount(100, false); //Create an image that shows the number of pixels each pixel is connected to
+var countmaskS2 = pixelcountS2.select(0).gt(25); //filter out all pixels connected to 4 or less 
+var final_RFS2 = cleanRFS2.updateMask(countmaskS2); //mask classfication image to exclude small patches
+
+//*************************************************************
+//3e. Vizualize Results
+//*************************************************************
+
+
+var paletteMAP2 = [
+'#440154FF', // Purple, Nypa Palm(Class value 1)
+'#39568CFF', // Dark Blue, Water (Class value 4) 
+'#29AF7FFF',//Light Green, Mangrove (Class value 5)
+];
+
+//Display the Classification
+//---------------------------
+
+var eastS2 = final_RFS2.clip(studyArea)
+Map.addLayer(eastS2.clip(studyArea), {min: 1, max: 5, palette: paletteMAP2},'Sentinel 2 Optical Classification',false);
+
+
+//*************************************************************
+//3f. Calculate Accuracy
+//*************************************************************
+
+
+var testing2 = s2Out.sampleRegions({
+                  collection: valid,
+                  properties:['UserClass'],
+                  scale:10,
+          });
+          
+
+
+// Classify the validation data.
+var testAccuracy2 = testing2.errorMatrix('Class_mode','UserClass',[1,4,5]);
+
+print('S2 Validation error matrix: ', testAccuracy2); //Generates the error matrix to demonstrate accuracy by landcover class type
+print('S2 Validation overall accuracy: ', testAccuracy2.accuracy());
+
+
+
+//=======================================================================================
+//STEP 4: Sentinel 1 SAR + Sentinel 2 MSI Mapping
+//=======================================================================================
+
+//*************************************************************
+//4a. Assemble Random Forest Classification
+//*************************************************************
+
+
+//Concatenate optical and SAR to train your data
+//------------------------------------------------
+var opt_sar = ee.Image.cat(compositeS2, compositeMask);
+
+//Define bands and train model
+//----------------------------
+var bands_opt_sar = ['VH','VV','RVI','SR','B2', 'B3', 'B4','B5','B6','B7', 'B8','B8A','NDVI'];
+
+//Assemble Random Forest Samples
+//-------------------------------
+var training_opt_sar = opt_sar.select(bands_opt_sar).sampleRegions({
+  collection: classes,
+  properties: ['landcover'],
+  scale: 10 });
+
+
+//*************************************************************
+//4b. Run Model and take Mode of 1000 runs
+//*************************************************************
+//Create Random Forest Classification Function
+//------------------------------------------- 
+var RF3 = function(i){
+  var classifier_opt_sar = ee.Classifier.smileRandomForest(500,4).train({
+  features: training_opt_sar, 
+  classProperty: 'landcover',
+  inputProperties: bands_opt_sar 
+});
+  var classified = opt_sar.select(bands_opt_sar).classify(classifier_opt_sar).select('classification').rename('Class')
+  return classified
+}
+
+//Run RFC Model 1,000 times
+//-------------------------------------------
+var modelRun3 = runs.map(RF3)
+
+//Take mode of the 1,000 runs
+//-------------------------------------------
+var classifiedboth = ee.ImageCollection(modelRun3).mode()
+
+
+var classBoth = classifiedboth.clip(ext2019)
+
+
+//*************************************************************
+//4c. Clean Results
+//*************************************************************
+
+
+//Clean up classification to eliminate small clusters of pixels
+// This reduces noise in the results to display areas that are likely mines rather 
+// than small disturbances or anomolies
+//-------------------------------------------------------------
+var cleanRFBOTH = classBoth.reduceNeighborhood({ //run classification through a neighborhood filter
+                reducer: ee.Reducer.mode(), //choose most common value in neighborhood
+                kernel: ee.Kernel.square(2,'pixels') //define neighborhood
+      });
+
+var pixelcountBOTH = cleanRFBOTH.connectedPixelCount(100, false); //Create an image that shows the number of pixels each pixel is connected to
+var countmaskBOTH = pixelcountBOTH.select(0).gt(25); //filter out all pixels connected to 4 or less 
+var final_RFBOTH = cleanRFBOTH.updateMask(countmaskBOTH); //mask classfication image to exclude small patches
+
+
+//*************************************************************
+//4d. Vizualize Results
+//*************************************************************
+
+//Subset to Study Area
+//----------------------
+var eastBoth = final_RFBOTH.clip(studyArea)
+
+Map.addLayer(bothOut, {min: 1, max: 5, palette: paletteMAP},'Optical/SAR Classification',false);
+
+
+//*************************************************************
+//4e. Calculate Accuracy
+//*************************************************************
+
+var testing3 = bothOut.sampleRegions({
+                  collection: valid,
+                  properties:['UserClass'],
+                  scale:10,
+          });
+        
+
+// Classify the validation data.
+//------------------------------
+var testAccuracy3 = testing3.errorMatrix('Class_mode','UserClass',[1,4,5]);
+
+print('BOTH Validation error matrixBOTH: ', testAccuracy3); //Generates the error matrix to demonstrate accuracy by landcover class type
+print('BOTHValidation overall accuracyBOTH: ', testAccuracy3.accuracy());
+
+
+//=======================================================================================
+//STEP 5: Export Results
+//=======================================================================================
+
+// //Export Final Classification to Asset
+//----------------------------------------
+
+//Sentinel1 SAR
+Export.image.toAsset({
+    image: clean.clip(studyArea),
+    description: 'NypaAnalysis/Classified_S1SAR_2020_NEWTRAINING_500Trees_4Vars_TDX_Feb2022',
+    region: studyArea,
+    scale: 10,
+    maxPixels: 1e13 
+  });
+
+//Sentinel 2 MSI
+Export.image.toAsset({
+    image: eastS2.clip(studyArea),
+    description: 'NypaAnalysis/Classified_S2Optical_2020_NEWTRAINING_500Trees_4Vars_TDX_Feb2022',
+    region: studyArea,
+    scale: 10,
+    maxPixels: 1e13 
+  });
+  
+// S1 and S2
+Export.image.toAsset({
+    image: eastBoth.clip(studyArea),
+    description: 'NypaAnalysis/Classified_S1_S2_SAR_Optical_2020_NEWTRAINING_500Trees_4Vars_TDX_Feb2022',
+    region: studyArea,
+    scale: 10,
+    maxPixels: 1e13 
+  });
+  
+
+// //Export Stratified Random Poiints
+// Export.table.toAsset({
+//   collection: valid,
+//   description:'2020FullValidApril2021'
+// });
+
+// //Export Stratified Random Poiints
+// Export.table.toAsset({
+//   collection: ee.FeatureCollection(studyArea),
+//   description:'NypaStudyAreaFitted',
+//   // fileFormat: 'SHP',
+// });
+
+
+//*****************************************************************************
+//                      End Code
+//*****************************************************************************
